@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-royalty}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-royalty}
+      POSTGRES_DB: ${POSTGRES_DB:-royalty}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-royalty} -d ${POSTGRES_DB:-royalty}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-royalty}:${POSTGRES_PASSWORD:-royalty}@db:5432/${POSTGRES_DB:-royalty}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+volumes:
+  pgdata:
