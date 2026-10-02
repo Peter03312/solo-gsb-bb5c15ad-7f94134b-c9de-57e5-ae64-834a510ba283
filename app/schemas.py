@@ -547,5 +547,80 @@ class ReceiptVersionList(BaseModel):
     batch_no: str
     versions: list[ReceiptVersionSummary]
 
+
+# ---- 权利人余额核对快照（财务冻结底稿）----
+
+class BalanceSnapshotIn(BaseModel):
+    # 唯一快照号（全局唯一；同号同集合重试幂等、同号异集合 409）
+    snapshot_no: str = Field(min_length=1, max_length=200)
+    # 权利人编号集合；空集合（或缺省）表示全体权利人。
+    # 集合内编号重复 422、权利人不存在 404，均整次拒绝且不留快照。
+    holder_codes: list[str] = Field(default_factory=list)
+
+    @field_validator("holder_codes")
+    @classmethod
+    def codes_wellformed(cls, v):
+        for code in v:
+            if not code or len(code) > 200:
+                raise ValueError(
+                    "holder_codes entries must be 1-200 characters"
+                )
+        return v
+
+
+class BalanceSnapshotLineOut(BaseModel):
+    holder_code: str
+    # 已出具单据净额（全部期间初次单与正负追补单的代数和）
+    billed_total: int
+    # 付款总额 / 退回总额 / 待确认预留额（均为整数分）
+    paid_total: int
+    refunded_total: int
+    reserved_total: int
+    # 余额 = billed_total - paid_total + refunded_total
+    balance: int
+    # 可用额 = balance - reserved_total
+    available_balance: int
+
+
+class BalanceSnapshotTotals(BaseModel):
+    # 冻结行数（空库快照为 0，各项金额总计为零）
+    holder_count: int
+    billed_total: int
+    paid_total: int
+    refunded_total: int
+    reserved_total: int
+    balance: int
+    available_balance: int
+
+
+class BalanceSnapshotOut(BaseModel):
+    snapshot_no: str
+    # created=新冻结；duplicate=同号同集合重试，返回原快照
+    status: str
+    # 是否全体权利人（请求集合为空）
+    scope_all: bool
+    # 规范化（升序）后的请求集合；全体时为空列表
+    holder_codes: list[str]
+    created_at: datetime
+    # 各项总计（跨全部冻结行）
+    totals: BalanceSnapshotTotals
+    # 全部冻结明细（按权利人编号升序）
+    lines: list[BalanceSnapshotLineOut]
+
+
+class BalanceSnapshotPage(BaseModel):
+    snapshot_no: str
+    scope_all: bool
+    holder_codes: list[str]
+    created_at: datetime
+    page: int
+    page_size: int
+    # 冻结行总数（分页导航用）
+    total_lines: int
+    # 各项总计（跨全部冻结行，与分页无关）
+    totals: BalanceSnapshotTotals
+    # 当前页冻结明细（按权利人编号升序）
+    lines: list[BalanceSnapshotLineOut]
+
 # 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用
 HolderLedger.model_rebuild()

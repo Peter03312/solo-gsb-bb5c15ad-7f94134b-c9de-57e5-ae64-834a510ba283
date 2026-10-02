@@ -97,6 +97,21 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 每版输出 **状态计数、全部逐行冻结结论（含匹配行的累计退回额）及差异行**；
     付款/退回与复核并发时，一版内全部结论来自 **同一已提交状态**（单语句快照）；
     核验 **不改写付款、退回、余额或单据**。
+- **权利人余额核对快照（财务冻结底稿）**：
+  - 财务凭 **唯一快照号 + 权利人编号集合（空集合表示全体）** 冻结一次余额核对底稿，
+    基于 **同一已提交数据库视图** 固化每人的 **已出具单据净额、付款总额、退回总额、
+    待确认预留额、余额（=单据净额−付款+退回）与可用额（=余额−待确认预留）**，
+    金额均为整数分，口径与权利人对账单一致；
+  - 集合内 **编号重复 422**、**权利人不存在 404**：**整次拒绝且不留快照**；
+    **同号同集合重试幂等返回原快照**（`status=duplicate`，HTTP 200），
+    **同号异集合 409 `snapshot_conflict`**（"空集合=全体"与"显式列全"亦属异集合）；
+  - 创建与出单、付款、退票、预留确认/取消并发时，整张快照的全部数字来自
+    **同一已提交视图**（单条 `INSERT…SELECT` 语句级快照），**不混合前后状态**；
+    同号并发创建经"快照号事务咨询锁"串行化，**恰一份快照**；
+  - 快照行 **一经写入不可修改/删除**（触发器强制）：后续出单、付款、退票、
+    预留确认/取消与权利人建档 **均不改写历史快照**；
+  - 按快照号 **分页读取冻结明细及各项总计**；空库快照返回 **零总计**；
+    未知快照号 **404 `snapshot_not_found`**。
 
 ## 一键启动
 
@@ -213,6 +228,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/receipts/{batch_no}` | 批次原始回单行（含重复回单标记）与最新版本号 |
 | GET | `/receipts/{batch_no}/versions` | 全部核验版本及各版状态计数（旧版本始终可查） |
 | GET | `/receipts/{batch_no}/versions/{version}` | 指定版本的状态计数及差异行（结论已冻结） |
+
+### 余额核对快照
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/balance-snapshots` | 冻结一次余额核对底稿（快照号 + 权利人集合，空集合=全体）；新快照 201，同号同集合重试 200 返回原快照，同号异集合 409 |
+| GET | `/balance-snapshots/{snapshot_no}` | 按快照号分页读取冻结明细与各项总计（`page`/`page_size`）；未知快照号 404 |
 
 `POST /payments` 请求体：
 
@@ -507,6 +529,66 @@ balance >= SUM(更早 pending 预留) + 本指令金额
 - `GET /receipts/{batch_no}/versions/{version}`：指定版本的状态计数及差异行；
   版本不存在 404 `receipt_version_not_found`。
 
+### 余额核对快照（财务冻结底稿）
+
+`POST /balance-snapshots` 请求体：
+
+```json
+{ "snapshot_no": "SNAP-20260331-01", "holder_codes": ["RS-A", "RS-B"] }
+```
+
+- `snapshot_no` 为调用方提供的**唯一快照号**（全局唯一）；
+  `holder_codes` 为权利人编号集合，**空集合（或省略该字段）表示全体权利人**。
+- 创建时基于 **同一已提交数据库视图** 冻结每人的六项整数分金额：
+  `billed_total`（已出具单据净额）、`paid_total`（付款总额）、
+  `refunded_total`（退回总额）、`reserved_total`（待确认预留额）、
+  `balance = billed_total − paid_total + refunded_total`、
+  `available_balance = balance − reserved_total`，口径与权利人对账单一致。
+- 成功响应（201，`status=created`）含全部冻结明细与各项总计：
+
+```json
+{
+  "snapshot_no": "SNAP-20260331-01",
+  "status": "created",
+  "scope_all": false,
+  "holder_codes": ["RS-A", "RS-B"],
+  "created_at": "2026-03-31T10:00:00Z",
+  "totals": {"holder_count": 2, "billed_total": 1000, "paid_total": 170,
+             "refunded_total": 30, "reserved_total": 75,
+             "balance": 860, "available_balance": 785},
+  "lines": [
+    {"holder_code": "RS-A", "billed_total": 600, "paid_total": 170,
+     "refunded_total": 30, "reserved_total": 25,
+     "balance": 460, "available_balance": 435},
+    {"holder_code": "RS-B", "billed_total": 400, "paid_total": 0,
+     "refunded_total": 0, "reserved_total": 50,
+     "balance": 400, "available_balance": 350}
+  ]
+}
+```
+
+- **幂等与拒绝**：同号同集合重试 **200 `status=duplicate` 返回原快照**
+  （集合与编号次序无关；省略 `holder_codes` 等同空集合）；
+  同号异集合 **409 `snapshot_conflict`**（注意"空集合=全体"与
+  "显式列出全体"属不同集合）；集合内编号重复 **422 `duplicate_holder_code`**、
+  权利人不存在 **404 `holder_not_found`**（`detail.missing_holder_codes`
+  列出缺失编号）——上述拒绝均 **整次拒绝、不留任何快照**。
+- **并发一致性**：创建与出单、付款、退票、预留确认/取消并发时，
+  整张快照的全部数字来自 **同一已提交数据库视图**（单条 `INSERT…SELECT`
+  语句级快照），每个并发操作要么完整落在视图之前、要么完整落在之后，
+  **绝不混合前后状态**；同号并发创建经"快照号事务咨询锁"串行化，恰一份快照。
+- **不改历史**：快照行一经写入不可修改/删除（触发器强制）——后续出单、
+  付款、退票、预留确认/取消与权利人建档均不影响已冻结快照；
+  空库（无任何权利人）快照返回零行、**零总计**。
+
+`GET /balance-snapshots/{snapshot_no}?page=1&page_size=50` 分页读取冻结明细：
+
+- `lines[]` 按权利人编号升序分页（`page` 从 1 开始，`page_size` 1–500，
+  越界 422）；`total_lines` 为冻结行总数；
+- `totals` 为 **跨全部冻结行** 的各项总计（与分页无关，每页相同）；
+- 未知快照号 **404 `snapshot_not_found`**。
+
+
 #### 逐笔归因查询参数
 
 | 参数 | 位置 | 说明 |
@@ -762,6 +844,45 @@ curl -sS -i -X POST http://localhost:8000/payment-reservations/CMD-2/confirm \
 curl -sS http://localhost:8000/rightsholders/RS-R/ledger | python3 -m json.tool
 ```
 
+财务冻结一次余额核对底稿（承上：RS-R 已有单据与付款流水）：
+
+```bash
+# 1) 全体权利人快照（空集合=全体）=> 201，固化每人六项金额与各项总计
+curl -sS -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-20260331-01","holder_codes":[]}' | python3 -m json.tool
+
+# 2) 同号同集合重试 => 200 status=duplicate 返回原快照；同号异集合 => 409
+curl -sS -i -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-20260331-01","holder_codes":[]}' | head -1
+curl -sS -i -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-20260331-01","holder_codes":["RS-R"]}' | head -1
+
+# 3) 编号重复 422 / 权利人不存在 404：整次拒绝，不留快照（随后 GET 均 404）
+curl -sS -i -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-BAD-1","holder_codes":["RS-R","RS-R"]}' | head -1
+curl -sS -i -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-BAD-2","holder_codes":["NOBODY"]}' | head -1
+
+# 4) 子集快照 + 分页读取冻结明细与各项总计（totals 跨全部行，每页相同）
+curl -sS -X POST http://localhost:8000/balance-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"SNAP-20260331-02","holder_codes":["RS-A","RS-R"]}'
+curl -sS "http://localhost:8000/balance-snapshots/SNAP-20260331-02?page=1&page_size=1" \
+  | python3 -m json.tool
+
+# 5) 后续流水与权利人建档不改历史：再登记付款、新建权利人后，旧快照原样返回
+curl -sS -X POST http://localhost:8000/rightsholders \
+  -H 'Content-Type: application/json' -d '{"code":"RS-NEW","name":"后建权利人"}'
+curl -sS "http://localhost:8000/balance-snapshots/SNAP-20260331-01" | python3 -m json.tool
+# 未知快照号 => 404 snapshot_not_found
+curl -sS -i "http://localhost:8000/balance-snapshots/SNAP-NOT-EXIST" | head -1
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -793,7 +914,10 @@ python3 -m unittest discover -s tests -v
 同付款多笔并发退回不合计超额/退回与付款及出单并发余额一致无死锁/
 对账单付款与退回总额分列）、回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/
 冻结结论与累计退回额/迟到付款及退回复核版本化/并发复核与并发导入/
-付款退回与复核并发快照一致/核验不改写账务）各有一套：
+付款退回与复核并发快照一致/核验不改写账务）、余额核对快照（空库零总计/
+口径与对账单一致/同号同集合幂等与异集合拒绝/编号重复与权利人不存在整次拒绝/
+分页与总计/冻结不改历史/同号并发恰一份/与付款出单退票预留并发不混合前后状态）
+各有一套：
 
 ```bash
 pip install pgserver httpx
@@ -803,6 +927,7 @@ PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利
 PYTHONPATH=. python3 tests/integration_reservations.py   # 付款额度预留两阶段与 FIFO
 PYTHONPATH=. python3 tests/integration_refunds.py        # 银行退票登记与回单退回额冻结
 PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导入与付款核验
+PYTHONPATH=. python3 tests/integration_snapshots.py      # 权利人余额核对快照
 ```
 
 ## 目录结构
@@ -819,6 +944,7 @@ app/
   reservations_service.py # 付款额度预留（指令号/流水号锁 + 指令行锁 + 权利人行锁；创建/取消/确认、FIFO 校验、幂等冲突）
   refunds_service.py      # 银行退票登记（退回流水号锁 + 原付款行锁 + 权利人行锁，累计超额拒绝/幂等冲突）
   receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
+  snapshots_service.py    # 余额核对快照（快照号锁 + 单语句快照冻结；幂等/异集合拒绝；分页与各项总计）
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
@@ -827,7 +953,8 @@ app/
     reservations.py       # 付款额度预留：创建 / 确认 / 取消 / 单条查询
     refunds.py            # 银行退票登记
     receipts.py           # 回单批次导入、复核、版本查询
-examples/demo.sh          # 端到端 curl 示例（含付款额度预留两阶段与负额追补 FIFO）
-tests/                    # 单元测试与六套 pgserver 端到端集成测试
+    snapshots.py          # 余额核对快照：创建 / 分页查询
+examples/demo.sh          # 端到端 curl 示例（含付款额度预留两阶段与负额追补 FIFO、余额核对快照）
+tests/                    # 单元测试与七套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

@@ -463,6 +463,58 @@ DROP TRIGGER IF EXISTS receipt_verification_lines_frozen_trg ON receipt_verifica
 CREATE TRIGGER receipt_verification_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON receipt_verification_lines
     FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+
+-- 权利人余额核对快照（财务冻结底稿）：
+-- 财务凭唯一快照号 snapshot_no 与权利人编号集合（空集合 = 全体，scope_all=true）
+-- 冻结一次余额核对底稿；同号同集合重试幂等返回原快照，同号异集合拒绝（409）。
+-- holder_codes 为规范化（升序）后的请求集合，全体时为空数组；
+-- content_hash 为请求集合的规范化内容哈希（与编号次序无关）。
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    snapshot_no  text NOT NULL UNIQUE,
+    scope_all    boolean NOT NULL,
+    holder_codes text[] NOT NULL,
+    content_hash text NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- 快照逐权利人冻结行：已出具单据净额、付款总额、退回总额、待确认预留额、
+-- 余额（= 单据净额 - 付款 + 退回）与可用额（= 余额 - 待确认预留），整数分。
+-- 冻结读取用单条 INSERT ... SELECT（语句级快照）：与出单、付款、退票、
+-- 预留确认/取消并发时，整张快照的全部数字来自同一已提交数据库视图。
+CREATE TABLE IF NOT EXISTS balance_snapshot_lines (
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    snapshot_id       bigint NOT NULL REFERENCES balance_snapshots(id) ON DELETE CASCADE,
+    holder_code       text NOT NULL,
+    billed_total      bigint NOT NULL,
+    paid_total        bigint NOT NULL,
+    refunded_total    bigint NOT NULL,
+    reserved_total    bigint NOT NULL,
+    balance           bigint NOT NULL,
+    available_balance bigint NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (snapshot_id, holder_code)
+);
+
+-- 历史不可变：快照与冻结行一经写入即禁止修改/删除——后续出单、付款、
+-- 退票、预留确认/取消与权利人建档均不改写历史快照。
+CREATE OR REPLACE FUNCTION balance_snapshots_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'balance snapshots and their frozen lines must not be '
+                  || TG_OP || 'd; later flows never rewrite history';
+END;
+$$;
+DROP TRIGGER IF EXISTS balance_snapshots_frozen_trg ON balance_snapshots;
+CREATE TRIGGER balance_snapshots_frozen_trg
+    BEFORE UPDATE OR DELETE ON balance_snapshots
+    FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
+DROP TRIGGER IF EXISTS balance_snapshot_lines_frozen_trg ON balance_snapshot_lines;
+CREATE TRIGGER balance_snapshot_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON balance_snapshot_lines
+    FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
 """
 
 
