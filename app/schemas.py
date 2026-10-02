@@ -547,5 +547,85 @@ class ReceiptVersionList(BaseModel):
     batch_no: str
     versions: list[ReceiptVersionSummary]
 
+
+# ---- 权利人余额核对底稿（一次性冻结快照）----
+
+class BalanceSnapshotIn(BaseModel):
+    # 调用方唯一快照号（同号同集合幂等、异集合 409）
+    snapshot_no: str = Field(min_length=1, max_length=200)
+    # 权利人编号集合；空列表（或省略）表示全体已建档权利人。
+    # 编号重复由服务层拒绝（422 duplicate_holder_code，整次不留快照）；
+    # 任一编号不存在 404 holder_not_found。
+    holder_codes: list[str] = Field(
+        default_factory=list, max_length=100000
+    )
+
+    @field_validator("holder_codes")
+    @classmethod
+    def non_empty_codes(cls, v: list[str]) -> list[str]:
+        for code in v:
+            if not isinstance(code, str) or not code or len(code) > 200:
+                raise ValueError(
+                    "holder_codes must be non-empty strings of length 1-200"
+                )
+        return v
+
+
+class BalanceSnapshotLine(BaseModel):
+    holder_code: str
+    # 全部期间已出具单据明细净额（正负追补单代数和；试算/待处理不入账）
+    billed_total: int
+    # 付款总额（保留付款总额，不因退票冲减）
+    paid_total: int
+    # 退回总额
+    refunded_total: int
+    # 待确认（pending）预留额合计
+    reserved_total: int
+    # 余额 = billed_total - paid_total + refunded_total（可为负）
+    balance: int
+    # 可用额 = balance - reserved_total（可为负）
+    available_balance: int
+
+
+class BalanceSnapshotTotals(BaseModel):
+    billed_total: int
+    paid_total: int
+    refunded_total: int
+    reserved_total: int
+    balance: int
+    available_balance: int
+
+
+class BalanceSnapshotCreated(BaseModel):
+    """创建（或同号同集合重试）返回的完整冻结底稿（含全部冻结行）。"""
+    snapshot_no: str
+    # created=新冻结；duplicate=同号同集合重试，返回原快照
+    status: str
+    # true=全体权利人（创建时已建档集合）；false=指定集合
+    scope_all: bool
+    # 规范化（去重、升序）后的冻结权利人集合
+    holder_codes: list[str]
+    holder_count: int
+    created_at: datetime
+    lines: list[BalanceSnapshotLine]
+    totals: BalanceSnapshotTotals
+
+
+class BalanceSnapshotPage(BaseModel):
+    """按快照号分页读取的冻结明细及全快照各项总计。"""
+    snapshot_no: str
+    scope_all: bool
+    holder_codes: list[str]
+    holder_count: int
+    created_at: datetime
+    page: int
+    page_size: int
+    total_records: int
+    # 当前页冻结明细（按权利人编号升序）；页超出范围为空
+    records: list[BalanceSnapshotLine]
+    # 全快照口径总计（不随分页变化；空快照各项为 0）
+    totals: BalanceSnapshotTotals
+
+
 # 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用
 HolderLedger.model_rebuild()

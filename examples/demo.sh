@@ -364,4 +364,25 @@ say "43) 权利人对账：待确认预留 reserved_total、可用额 available_
 $C "$BASE/rightsholders/RS-R/ledger" | python3 -m json.tool
 $C "$BASE/payment-reservations/RESV-CMD-0001" | python3 -m json.tool
 
+say "44) 冻结余额核对底稿：指定权利人集合（空集合=全体），固化单据净额/付款/退回/预留/余额/可用额"
+$C -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-0001","holder_codes":["RS-A","RS-R"]}' \
+  | python3 -m json.tool
+# 同号同集合重试（次序不同也幂等）=> 200 duplicate；同号异集合 => 409
+$C -i -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-0001","holder_codes":["RS-R","RS-A"]}' | head -1
+$C -i -X POST "$BASE/balance-snapshots" -H 'Content-Type:application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-0001","holder_codes":["RS-A"]}' | head -1
+# 编号重复 422；权利人不存在 404（均不留快照）
+$C -i -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-BAD","holder_codes":["RS-A","RS-A"]}' | head -1
+$C -i -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-BAD","holder_codes":["NOBODY"]}' | head -1
+
+say "45) 全体快照与分页读取（totals 为全快照口径，不随分页变化）"
+$C -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
+  -d '{"snapshot_no":"BAL-DEMO-ALL","holder_codes":[]}' | python3 -m json.tool
+$C "$BASE/balance-snapshots/BAL-DEMO-ALL?page=1&page_size=2" | python3 -m json.tool
+$C -i "$BASE/balance-snapshots/NO-SUCH-SNAP" | head -1   # 404 balance_snapshot_not_found
+
 say "完成"

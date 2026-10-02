@@ -463,6 +463,69 @@ DROP TRIGGER IF EXISTS receipt_verification_lines_frozen_trg ON receipt_verifica
 CREATE TRIGGER receipt_verification_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON receipt_verification_lines
     FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+
+-- 权利人余额核对底稿（财务一次性冻结快照）：
+-- 财务凭调用方唯一快照号 snapshot_no 与权利人编号集合 holder_codes
+-- （空集合表示全体已建档权利人）冻结一次核对底稿。同一快照内每位权利人
+-- 固化"已出具单据净额、付款总额、退回总额、待确认预留额、余额及可用额"，
+-- 全部取自创建事务中同一已提交数据库视图（REPEATABLE READ），
+-- 与出单、付款、退票、预留确认或取消并发时绝不混合前后状态。
+-- snapshot_no 全局唯一：同号同集合重试幂等返回原快照，同号异集合拒绝（409）；
+-- 编号重复或任一权利人不存在时整次拒绝，不留任何快照。
+-- scope_all=true 表示"全体权利人"：以创建时的已建档权利人为准冻结行集，
+-- 此后新建权利人不改历史；scope_all=false 时 holder_codes 为提交集合
+-- （规范化为去重、升序后冻结）。
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    snapshot_no  text NOT NULL UNIQUE,
+    scope_all    boolean NOT NULL,
+    holder_codes text[] NOT NULL DEFAULT '{}',
+    holder_count integer NOT NULL CHECK (holder_count >= 0),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- 快照冻结明细行：每位权利人一行，金额均为整数分。
+-- 余额 = 单据净额 - 付款 + 退回；可用额 = 余额 - 待确认预留（均可为负）。
+-- 行一经写入即不可修改/删除；后续流水与新建权利人不改写历史。
+CREATE TABLE IF NOT EXISTS balance_snapshot_lines (
+    snapshot_id       bigint NOT NULL REFERENCES balance_snapshots(id) ON DELETE CASCADE,
+    holder_code       text NOT NULL,
+    billed_total      bigint NOT NULL,
+    paid_total        bigint NOT NULL CHECK (paid_total >= 0),
+    refunded_total    bigint NOT NULL CHECK (refunded_total >= 0),
+    reserved_total    bigint NOT NULL CHECK (reserved_total >= 0),
+    balance           bigint NOT NULL,
+    available_balance bigint NOT NULL,
+    PRIMARY KEY (snapshot_id, holder_code),
+    -- 纵深防御：固化口径恒为"单据净额 - 付款 + 退回"、
+    -- 可用额恒为"余额 - 待确认预留"（正常路径由同一条 SQL 聚合写入）。
+    CONSTRAINT balance_snapshot_lines_balance_chk
+        CHECK (balance = billed_total - paid_total + refunded_total),
+    CONSTRAINT balance_snapshot_lines_available_chk
+        CHECK (available_balance = balance - reserved_total)
+);
+-- 按快照分页读取冻结明细的主索引（行内按权利人编号升序，次序稳定）
+CREATE INDEX IF NOT EXISTS balance_snapshot_lines_snapshot_holder_idx
+    ON balance_snapshot_lines(snapshot_id, holder_code);
+
+-- 历史不可变：快照头与冻结明细一经写入即禁止修改/删除（级联删除快照头除外）。
+CREATE OR REPLACE FUNCTION balance_snapshots_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'balance reconciliation snapshots are frozen and must not be '
+                  || TG_OP || 'd; later flows and new rightsholders never rewrite history';
+END;
+$$;
+DROP TRIGGER IF EXISTS balance_snapshots_frozen_trg ON balance_snapshots;
+CREATE TRIGGER balance_snapshots_frozen_trg
+    BEFORE UPDATE OR DELETE ON balance_snapshots
+    FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
+DROP TRIGGER IF EXISTS balance_snapshot_lines_frozen_trg ON balance_snapshot_lines;
+CREATE TRIGGER balance_snapshot_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON balance_snapshot_lines
+    FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
 """
 
 
